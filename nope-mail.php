@@ -28,6 +28,12 @@ final class NopeMail_Plugin
         add_filter('registration_errors', [__CLASS__, 'filter_registration_errors'], 10, 3);
         add_filter('wpmu_validate_user_signup', [__CLASS__, 'filter_multisite_signup_errors']);
         add_filter('woocommerce_registration_errors', [__CLASS__, 'filter_woocommerce_registration_errors'], 10, 3);
+        add_filter('user_row_actions', [__CLASS__, 'add_user_row_actions'], 10, 2);
+
+        add_action('admin_action_nopemail_ban_email', [__CLASS__, 'handle_ban_email_action']);
+        add_action('admin_action_nopemail_ban_domain', [__CLASS__, 'handle_ban_domain_action']);
+        add_action('admin_notices', [__CLASS__, 'render_admin_notice']);
+        add_action('network_admin_notices', [__CLASS__, 'render_admin_notice']);
     }
 
     public static function add_settings_page(): void
@@ -138,6 +144,174 @@ final class NopeMail_Plugin
         submit_button(__('Save Changes', 'nopemail'));
         echo '</form>';
         echo '</div>';
+    }
+
+    public static function add_user_row_actions(array $actions, WP_User $user): array
+    {
+        if (!is_admin() || !current_user_can('list_users')) {
+            return $actions;
+        }
+
+        $user_email = strtolower(trim((string) $user->user_email));
+        if ($user_email === '' || strpos($user_email, '@') === false) {
+            return $actions;
+        }
+
+        $scope = self::get_manage_scope();
+        if ($scope === '') {
+            return $actions;
+        }
+
+        $users_page_url = is_network_admin() ? network_admin_url('users.php') : admin_url('users.php');
+
+        $email_url = wp_nonce_url(
+            add_query_arg(
+                [
+                    'action' => 'nopemail_ban_email',
+                    'user_id' => $user->ID,
+                    'scope' => $scope,
+                ],
+                $users_page_url
+            ),
+            'nopemail_ban_email_' . $user->ID
+        );
+
+        $domain_url = wp_nonce_url(
+            add_query_arg(
+                [
+                    'action' => 'nopemail_ban_domain',
+                    'user_id' => $user->ID,
+                    'scope' => $scope,
+                ],
+                $users_page_url
+            ),
+            'nopemail_ban_domain_' . $user->ID
+        );
+
+        $actions['nopemail_ban_email'] = '<a href="' . esc_url($email_url) . '">' . esc_html__('Ban email address', 'nopemail') . '</a>';
+        $actions['nopemail_ban_domain'] = '<a href="' . esc_url($domain_url) . '">' . esc_html__('Ban domain', 'nopemail') . '</a>';
+
+        return $actions;
+    }
+
+    public static function handle_ban_email_action(): void
+    {
+        self::handle_ban_action('email');
+    }
+
+    public static function handle_ban_domain_action(): void
+    {
+        self::handle_ban_action('domain');
+    }
+
+    private static function handle_ban_action(string $type): void
+    {
+        if (!current_user_can('list_users')) {
+            wp_die(esc_html__('You do not have permission to perform this action.', 'nopemail'));
+        }
+
+        $user_id = isset($_GET['user_id']) ? (int) $_GET['user_id'] : 0;
+        if ($user_id <= 0) {
+            self::redirect_users_with_notice('missing_user');
+        }
+
+        $action_name = $type === 'domain' ? 'nopemail_ban_domain_' : 'nopemail_ban_email_';
+        check_admin_referer($action_name . $user_id);
+
+        $user = get_userdata($user_id);
+        if (!$user instanceof WP_User) {
+            self::redirect_users_with_notice('missing_user');
+        }
+
+        $scope = isset($_GET['scope']) ? sanitize_key((string) $_GET['scope']) : '';
+        if ($scope !== 'site' && $scope !== 'network') {
+            $scope = self::get_manage_scope();
+        }
+
+        if ($scope === 'network') {
+            if (!current_user_can('manage_network_options')) {
+                wp_die(esc_html__('You do not have permission to manage network rules.', 'nopemail'));
+            }
+            $saved = self::append_rule_to_network($user->user_email, $type);
+        } else {
+            if (!current_user_can('manage_options')) {
+                wp_die(esc_html__('You do not have permission to manage site rules.', 'nopemail'));
+            }
+            $saved = self::append_rule_to_site($user->user_email, $type);
+        }
+
+        self::redirect_users_with_notice($saved ? 'added' : 'exists');
+    }
+
+    private static function append_rule_to_site(string $email, string $type): bool
+    {
+        $rule = self::build_rule_from_email($email, $type);
+        if ($rule === '') {
+            return false;
+        }
+
+        $rules = self::normalize_rules((string) get_option(self::OPTION_KEY, ''));
+        if (in_array($rule, $rules, true)) {
+            return false;
+        }
+
+        $rules[] = $rule;
+        return update_option(self::OPTION_KEY, implode("\n", array_values(array_unique($rules))));
+    }
+
+    private static function append_rule_to_network(string $email, string $type): bool
+    {
+        $rule = self::build_rule_from_email($email, $type);
+        if ($rule === '') {
+            return false;
+        }
+
+        $rules = self::normalize_rules((string) get_site_option(self::OPTION_KEY, ''));
+        if (in_array($rule, $rules, true)) {
+            return false;
+        }
+
+        $rules[] = $rule;
+        return update_site_option(self::OPTION_KEY, implode("\n", array_values(array_unique($rules))));
+    }
+
+    private static function build_rule_from_email(string $email, string $type): string
+    {
+        $email = strtolower(trim($email));
+        if ($email === '' || strpos($email, '@') === false) {
+            return '';
+        }
+
+        if ($type === 'email') {
+            return $email;
+        }
+
+        $domain = substr(strrchr($email, '@') ?: '', 1);
+        if ($domain === '') {
+            return '';
+        }
+
+        return '@' . $domain;
+    }
+
+    private static function get_manage_scope(): string
+    {
+        if (is_network_admin() && current_user_can('manage_network_options')) {
+            return 'network';
+        }
+
+        if (current_user_can('manage_options')) {
+            return 'site';
+        }
+
+        return '';
+    }
+
+    private static function redirect_users_with_notice(string $status): void
+    {
+        $target = is_network_admin() ? network_admin_url('users.php') : admin_url('users.php');
+        wp_safe_redirect(add_query_arg(['nopemail_status' => $status], $target));
+        exit;
     }
 
     public static function save_network_settings(): void
@@ -260,6 +434,26 @@ final class NopeMail_Plugin
         }
 
         return $errors;
+    }
+
+    public static function render_admin_notice(): void
+    {
+        if (!isset($_GET['nopemail_status'])) {
+            return;
+        }
+
+        $status = sanitize_key((string) wp_unslash($_GET['nopemail_status']));
+        $messages = [
+            'added' => __('NopeMail rule added.', 'nopemail'),
+            'exists' => __('That rule is already blocked.', 'nopemail'),
+            'missing_user' => __('Unable to find that user.', 'nopemail'),
+        ];
+
+        if (!isset($messages[$status])) {
+            return;
+        }
+
+        echo '<div class="notice notice-success is-dismissible"><p>' . esc_html($messages[$status]) . '</p></div>';
     }
 
     private static function blocked_message(): string
