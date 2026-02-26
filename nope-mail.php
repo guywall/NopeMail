@@ -1,0 +1,468 @@
+<?php
+/**
+ * Plugin Name: NopeMail
+ * Description: Blocks account registrations that use disallowed email patterns.
+ * Version: 1.0.0
+ * Author: NopeMail
+ * Text Domain: nopemail
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+final class NopeMail_Plugin
+{
+    private const OPTION_KEY = 'nopemail_blocked_patterns';
+
+    public static function init(): void
+    {
+        add_action('admin_menu', [__CLASS__, 'add_settings_page']);
+        add_action('admin_init', [__CLASS__, 'register_setting']);
+
+        if (is_multisite()) {
+            add_action('network_admin_menu', [__CLASS__, 'add_network_settings_page']);
+            add_action('network_admin_edit_nopemail_save_network_settings', [__CLASS__, 'save_network_settings']);
+        }
+
+        add_filter('registration_errors', [__CLASS__, 'filter_registration_errors'], 10, 3);
+        add_filter('wpmu_validate_user_signup', [__CLASS__, 'filter_multisite_signup_errors']);
+        add_filter('woocommerce_registration_errors', [__CLASS__, 'filter_woocommerce_registration_errors'], 10, 3);
+        add_filter('user_row_actions', [__CLASS__, 'add_user_row_actions'], 10, 2);
+
+        add_action('admin_action_nopemail_ban_email', [__CLASS__, 'handle_ban_email_action']);
+        add_action('admin_action_nopemail_ban_domain', [__CLASS__, 'handle_ban_domain_action']);
+        add_action('admin_notices', [__CLASS__, 'render_admin_notice']);
+        add_action('network_admin_notices', [__CLASS__, 'render_admin_notice']);
+    }
+
+    public static function add_settings_page(): void
+    {
+        add_options_page(
+            __('NopeMail', 'nopemail'),
+            __('NopeMail', 'nopemail'),
+            'manage_options',
+            'nopemail',
+            [__CLASS__, 'render_settings_page']
+        );
+    }
+
+    public static function register_setting(): void
+    {
+        register_setting(
+            'nopemail_settings',
+            self::OPTION_KEY,
+            [
+                'type' => 'string',
+                'sanitize_callback' => [__CLASS__, 'sanitize_patterns_input'],
+                'default' => '',
+            ]
+        );
+
+        add_settings_section(
+            'nopemail_main_section',
+            __('Blocked email rules', 'nopemail'),
+            static function (): void {
+                echo '<p>' . esc_html__('Enter one rule per line. Rules can be full addresses (test@example.com), domains (@spam.com), or partial matches (.ru).', 'nopemail') . '</p>';
+            },
+            'nopemail'
+        );
+
+        add_settings_field(
+            self::OPTION_KEY,
+            __('Rules', 'nopemail'),
+            [__CLASS__, 'render_rules_field'],
+            'nopemail',
+            'nopemail_main_section'
+        );
+    }
+
+    public static function render_rules_field(): void
+    {
+        $value = get_option(self::OPTION_KEY, '');
+        echo '<textarea name="' . esc_attr(self::OPTION_KEY) . '" rows="12" cols="60" class="large-text code">' . esc_textarea($value) . '</textarea>';
+
+        if (!is_multisite() || is_network_admin()) {
+            return;
+        }
+
+        $network_rules = self::normalize_rules((string) get_site_option(self::OPTION_KEY, ''));
+        if ($network_rules === []) {
+            return;
+        }
+
+        echo '<p><strong>' . esc_html__('Network-wide blocked rules (read-only):', 'nopemail') . '</strong></p>';
+        echo '<ul style="margin-top:0;">';
+        foreach ($network_rules as $rule) {
+            echo '<li><code>' . esc_html($rule) . '</code></li>';
+        }
+        echo '</ul>';
+    }
+
+    public static function render_settings_page(): void
+    {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        echo '<div class="wrap">';
+        echo '<h1>' . esc_html__('NopeMail Settings', 'nopemail') . '</h1>';
+        echo '<form method="post" action="options.php">';
+        settings_fields('nopemail_settings');
+        do_settings_sections('nopemail');
+        submit_button();
+        echo '</form>';
+        echo '</div>';
+    }
+
+    public static function add_network_settings_page(): void
+    {
+        add_submenu_page(
+            'settings.php',
+            __('NopeMail', 'nopemail'),
+            __('NopeMail', 'nopemail'),
+            'manage_network_options',
+            'nopemail-network',
+            [__CLASS__, 'render_network_settings_page']
+        );
+    }
+
+    public static function render_network_settings_page(): void
+    {
+        if (!current_user_can('manage_network_options')) {
+            return;
+        }
+
+        $value = get_site_option(self::OPTION_KEY, '');
+
+        echo '<div class="wrap">';
+        echo '<h1>' . esc_html__('NopeMail Network Settings', 'nopemail') . '</h1>';
+        echo '<form method="post" action="edit.php?action=nopemail_save_network_settings">';
+        wp_nonce_field('nopemail_network_settings');
+        echo '<p>' . esc_html__('Enter one rule per line. Network rules are applied on every site.', 'nopemail') . '</p>';
+        echo '<textarea name="' . esc_attr(self::OPTION_KEY) . '" rows="12" cols="60" class="large-text code">' . esc_textarea($value) . '</textarea>';
+        submit_button(__('Save Changes', 'nopemail'));
+        echo '</form>';
+        echo '</div>';
+    }
+
+    public static function add_user_row_actions(array $actions, WP_User $user): array
+    {
+        if (!is_admin() || !current_user_can('list_users')) {
+            return $actions;
+        }
+
+        $user_email = strtolower(trim((string) $user->user_email));
+        if ($user_email === '' || strpos($user_email, '@') === false) {
+            return $actions;
+        }
+
+        $scope = self::get_manage_scope();
+        if ($scope === '') {
+            return $actions;
+        }
+
+        $users_page_url = is_network_admin() ? network_admin_url('users.php') : admin_url('users.php');
+
+        $email_url = wp_nonce_url(
+            add_query_arg(
+                [
+                    'action' => 'nopemail_ban_email',
+                    'user_id' => $user->ID,
+                    'scope' => $scope,
+                ],
+                $users_page_url
+            ),
+            'nopemail_ban_email_' . $user->ID
+        );
+
+        $domain_url = wp_nonce_url(
+            add_query_arg(
+                [
+                    'action' => 'nopemail_ban_domain',
+                    'user_id' => $user->ID,
+                    'scope' => $scope,
+                ],
+                $users_page_url
+            ),
+            'nopemail_ban_domain_' . $user->ID
+        );
+
+        $actions['nopemail_ban_email'] = '<a href="' . esc_url($email_url) . '">' . esc_html__('Ban email address', 'nopemail') . '</a>';
+        $actions['nopemail_ban_domain'] = '<a href="' . esc_url($domain_url) . '">' . esc_html__('Ban domain', 'nopemail') . '</a>';
+
+        return $actions;
+    }
+
+    public static function handle_ban_email_action(): void
+    {
+        self::handle_ban_action('email');
+    }
+
+    public static function handle_ban_domain_action(): void
+    {
+        self::handle_ban_action('domain');
+    }
+
+    private static function handle_ban_action(string $type): void
+    {
+        if (!current_user_can('list_users')) {
+            wp_die(esc_html__('You do not have permission to perform this action.', 'nopemail'));
+        }
+
+        $user_id = isset($_GET['user_id']) ? (int) $_GET['user_id'] : 0;
+        if ($user_id <= 0) {
+            self::redirect_users_with_notice('missing_user');
+        }
+
+        $action_name = $type === 'domain' ? 'nopemail_ban_domain_' : 'nopemail_ban_email_';
+        check_admin_referer($action_name . $user_id);
+
+        $user = get_userdata($user_id);
+        if (!$user instanceof WP_User) {
+            self::redirect_users_with_notice('missing_user');
+        }
+
+        $scope = isset($_GET['scope']) ? sanitize_key((string) $_GET['scope']) : '';
+        if ($scope !== 'site' && $scope !== 'network') {
+            $scope = self::get_manage_scope();
+        }
+
+        if ($scope === 'network') {
+            if (!current_user_can('manage_network_options')) {
+                wp_die(esc_html__('You do not have permission to manage network rules.', 'nopemail'));
+            }
+            $saved = self::append_rule_to_network($user->user_email, $type);
+        } else {
+            if (!current_user_can('manage_options')) {
+                wp_die(esc_html__('You do not have permission to manage site rules.', 'nopemail'));
+            }
+            $saved = self::append_rule_to_site($user->user_email, $type);
+        }
+
+        self::redirect_users_with_notice($saved ? 'added' : 'exists');
+    }
+
+    private static function append_rule_to_site(string $email, string $type): bool
+    {
+        $rule = self::build_rule_from_email($email, $type);
+        if ($rule === '') {
+            return false;
+        }
+
+        $rules = self::normalize_rules((string) get_option(self::OPTION_KEY, ''));
+        if (in_array($rule, $rules, true)) {
+            return false;
+        }
+
+        $rules[] = $rule;
+        return update_option(self::OPTION_KEY, implode("\n", array_values(array_unique($rules))));
+    }
+
+    private static function append_rule_to_network(string $email, string $type): bool
+    {
+        $rule = self::build_rule_from_email($email, $type);
+        if ($rule === '') {
+            return false;
+        }
+
+        $rules = self::normalize_rules((string) get_site_option(self::OPTION_KEY, ''));
+        if (in_array($rule, $rules, true)) {
+            return false;
+        }
+
+        $rules[] = $rule;
+        return update_site_option(self::OPTION_KEY, implode("\n", array_values(array_unique($rules))));
+    }
+
+    private static function build_rule_from_email(string $email, string $type): string
+    {
+        $email = strtolower(trim($email));
+        if ($email === '' || strpos($email, '@') === false) {
+            return '';
+        }
+
+        if ($type === 'email') {
+            return $email;
+        }
+
+        $domain = substr(strrchr($email, '@') ?: '', 1);
+        if ($domain === '') {
+            return '';
+        }
+
+        return '@' . $domain;
+    }
+
+    private static function get_manage_scope(): string
+    {
+        if (is_network_admin() && current_user_can('manage_network_options')) {
+            return 'network';
+        }
+
+        if (current_user_can('manage_options')) {
+            return 'site';
+        }
+
+        return '';
+    }
+
+    private static function redirect_users_with_notice(string $status): void
+    {
+        $target = is_network_admin() ? network_admin_url('users.php') : admin_url('users.php');
+        wp_safe_redirect(add_query_arg(['nopemail_status' => $status], $target));
+        exit;
+    }
+
+    public static function save_network_settings(): void
+    {
+        if (!current_user_can('manage_network_options')) {
+            wp_die(esc_html__('You do not have permission to access this page.', 'nopemail'));
+        }
+
+        check_admin_referer('nopemail_network_settings');
+
+        $raw = isset($_POST[self::OPTION_KEY]) ? wp_unslash((string) $_POST[self::OPTION_KEY]) : '';
+        $sanitized = self::sanitize_patterns_input($raw);
+        update_site_option(self::OPTION_KEY, $sanitized);
+
+        wp_safe_redirect(add_query_arg(['page' => 'nopemail-network', 'updated' => 'true'], network_admin_url('settings.php')));
+        exit;
+    }
+
+    public static function sanitize_patterns_input(string $value): string
+    {
+        $rules = self::normalize_rules($value);
+        return implode("\n", $rules);
+    }
+
+    /**
+     * @return string[]
+     */
+    private static function normalize_rules(string $raw): array
+    {
+        $parts = preg_split('/[\r\n,]+/', $raw) ?: [];
+        $rules = [];
+
+        foreach ($parts as $part) {
+            $rule = strtolower(trim((string) $part));
+            if ($rule === '') {
+                continue;
+            }
+            $rules[$rule] = $rule;
+        }
+
+        return array_values($rules);
+    }
+
+    /**
+     * @return string[]
+     */
+    private static function get_all_rules(): array
+    {
+        $site_rules = self::normalize_rules((string) get_option(self::OPTION_KEY, ''));
+        if (!is_multisite()) {
+            return $site_rules;
+        }
+
+        $network_rules = self::normalize_rules((string) get_site_option(self::OPTION_KEY, ''));
+        return array_values(array_unique(array_merge($network_rules, $site_rules)));
+    }
+
+    private static function is_email_blocked(string $email): bool
+    {
+        $email = strtolower(trim($email));
+        if ($email === '') {
+            return false;
+        }
+
+        foreach (self::get_all_rules() as $rule) {
+            if (self::matches_rule($email, $rule)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static function matches_rule(string $email, string $rule): bool
+    {
+        if ($rule === '') {
+            return false;
+        }
+
+        if (strpos($rule, '@') !== false && $rule[0] !== '@') {
+            return $email === $rule;
+        }
+
+        if (strpos($rule, '@') === 0) {
+            return substr($email, -strlen($rule)) === $rule;
+        }
+
+        return strpos($email, $rule) !== false;
+    }
+
+    public static function filter_registration_errors(WP_Error $errors, string $sanitized_user_login, string $user_email): WP_Error
+    {
+        if (self::is_email_blocked($user_email)) {
+            $errors->add('nopemail_blocked_email', self::blocked_message());
+        }
+
+        return $errors;
+    }
+
+    public static function filter_multisite_signup_errors(array $result): array
+    {
+        if (!isset($result['user_email'])) {
+            return $result;
+        }
+
+        if (self::is_email_blocked((string) $result['user_email'])) {
+            if (!isset($result['errors']) || !($result['errors'] instanceof WP_Error)) {
+                $result['errors'] = new WP_Error();
+            }
+            $result['errors']->add('nopemail_blocked_email', self::blocked_message());
+        }
+
+        return $result;
+    }
+
+    public static function filter_woocommerce_registration_errors(WP_Error $errors, string $username, string $email): WP_Error
+    {
+        if (self::is_email_blocked($email)) {
+            $errors->add('nopemail_blocked_email', self::blocked_message());
+        }
+
+        return $errors;
+    }
+
+    public static function render_admin_notice(): void
+    {
+        if (!isset($_GET['nopemail_status'])) {
+            return;
+        }
+
+        $status = sanitize_key((string) wp_unslash($_GET['nopemail_status']));
+        $messages = [
+            'added' => __('NopeMail rule added.', 'nopemail'),
+            'exists' => __('That rule is already blocked.', 'nopemail'),
+            'missing_user' => __('Unable to find that user.', 'nopemail'),
+        ];
+
+        if (!isset($messages[$status])) {
+            return;
+        }
+
+        echo '<div class="notice notice-success is-dismissible"><p>' . esc_html($messages[$status]) . '</p></div>';
+    }
+
+    private static function blocked_message(): string
+    {
+        return (string) apply_filters(
+            'nopemail_blocked_message',
+            __('Sorry, registrations with that email address are not allowed.', 'nopemail')
+        );
+    }
+}
+
+NopeMail_Plugin::init();
