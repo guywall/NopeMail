@@ -75,6 +75,22 @@ final class NopeMail_Plugin
     {
         $value = get_option(self::OPTION_KEY, '');
         echo '<textarea name="' . esc_attr(self::OPTION_KEY) . '" rows="12" cols="60" class="large-text code">' . esc_textarea($value) . '</textarea>';
+
+        if (!is_multisite() || is_network_admin()) {
+            return;
+        }
+
+        $network_rules = self::normalize_rules((string) get_site_option(self::OPTION_KEY, ''));
+        if ($network_rules === []) {
+            return;
+        }
+
+        echo '<p><strong>' . esc_html__('Network-wide blocked rules (read-only):', 'nopemail') . '</strong></p>';
+        echo '<ul style="margin-top:0;">';
+        foreach ($network_rules as $rule) {
+            echo '<li><code>' . esc_html($rule) . '</code></li>';
+        }
+        echo '</ul>';
     }
 
     public static function render_settings_page(): void
